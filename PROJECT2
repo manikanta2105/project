@@ -1,0 +1,136 @@
+import os
+import io
+import time
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+from flask import Flask, request, render_template_string, redirect, url_for, flash, send_from_directory, jsonify, abort
+from werkzeug.utils import secure_filename
+from PIL import Image
+import numpy as np
+from tensorflow.keras.applications import mobilenet_v2
+from tensorflow.keras.preprocessing import image as keras_image
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input, decode_predictions
+
+APP_NAME = "Professional Image Recognition"
+UPLOAD_FOLDER = Path("uploads")
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+MAX_CONTENT_LENGTH = 6 * 1024 * 1024
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "bmp", "gif"}
+CLEANUP_KEEP_DAYS = 1
+MODEL_INPUT_SIZE = (224, 224)
+TOP_K = 5
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("image_recognition_app")
+
+app = Flask(_name_)
+app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24))
+
+logger.info("Loading MobileNetV2 model...")
+MODEL = mobilenet_v2.MobileNetV2(weights="imagenet")
+logger.info("Model loaded.")
+
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def secure_timestamped_filename(filename: str) -> str:
+    base = secure_filename(filename)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{timestamp}_{base}"
+
+def prepare_image_from_bytes(file_bytes: bytes, target_size: Tuple[int, int] = MODEL_INPUT_SIZE) -> np.ndarray:
+    img = Image.open(io.BytesIO(file_bytes))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img = img.resize(target_size)
+    arr = keras_image.img_to_array(img)
+    arr = np.expand_dims(arr, axis=0)
+    arr = preprocess_input(arr)
+    return arr
+
+def predict_topk(preprocessed: np.ndarray, topk: int = TOP_K) -> List[Dict[str, Any]]:
+    preds = MODEL.predict(preprocessed)
+    decoded = decode_predictions(preds, top=topk)[0]
+    return [{"id": c, "label": n.replace("_", " "), "probability": float(p)} for c, n, p in decoded]
+
+def cleanup_old_uploads(folder: Path = UPLOAD_FOLDER, keep_days: int = CLEANUP_KEEP_DAYS) -> int:
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=keep_days)
+    removed = 0
+    for p in folder.iterdir():
+        try:
+            if p.is_file() and datetime.utcfromtimestamp(p.stat().st_mtime) < cutoff:
+                p.unlink()
+                removed += 1
+        except:
+            pass
+    if removed:
+        logger.info("Cleanup: removed %d old uploads", removed)
+    return removed
+
+HTML_TEMPLATE = """
+<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{{ app_name }}</title>
+<style>body{font-family:Inter,system-ui;-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;margin:24px;color:#111}.container{max-width:980px;margin:0 auto}.card{border:1px solid #e6e9ee;padding:16px;border-radius:8px;background:#fff;box-shadow:0 1px 2px rgba(16,24,40,.04)}button{background:#0b5fff;color:#fff;border:0;padding:8px 12px;border-radius:6px;cursor:pointer}button.secondary{background:#f1f5f9;color:#111}.results{margin-top:18px;display:flex;gap:18px;align-items:flex-start}img.preview{max-width:360px;border-radius:6px;border:1px solid #eef2f7}table{border-collapse:collapse;width:100%}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #f1f5f9}.muted{color:#6b7280;font-size:.95rem}.flash{color:#b91c1c;margin-bottom:12px}</style></head>
+<body><div class="container"><h1>{{ app_name }}</h1>
+<form method="post" enctype="multipart/form-data">
+<input type="file" name="file" accept="image/*" required/>
+<button type="submit">Upload & Predict</button></form>
+{% if results %}
+<div class="results"><div class="card"><table><thead><tr><th>Label</th><th>Probability</th></tr></thead><tbody>
+{% for r in results %}<tr><td>{{ r.label }}</td><td>{{ '{:.2%}'.format(r.probability) }}</td></tr>{% endfor %}
+</tbody></table></div><div class="card"><img class="preview" src="{{ img_url }}" alt="uploaded image"/></div></div>
+{% endif %}
+</div></body></html>
+"""
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    cleanup_old_uploads()
+    results, img_url, filename = None, None, None
+    if request.method == "POST":
+        if "file" not in request.files:
+            flash("Missing file.")
+            return redirect(request.url)
+        file = request.files["file"]
+        if file.filename == "" or not allowed_file(file.filename):
+            flash("Invalid file.")
+            return redirect(request.url)
+        file_bytes = file.read()
+        arr = prepare_image_from_bytes(file_bytes)
+        preds = predict_topk(arr, topk=TOP_K)
+        filename = secure_timestamped_filename(file.filename)
+        path = UPLOAD_FOLDER / filename
+        with open(path, "wb") as f: f.write(file_bytes)
+        img_url = url_for("uploaded_file", filename=filename)
+        results = preds
+    return render_template_string(HTML_TEMPLATE, app_name=APP_NAME, results=results, img_url=img_url, filename=filename)
+
+@app.route("/uploads/<path:filename>")
+def uploaded_file(filename):
+    safe = secure_filename(filename)
+    path = UPLOAD_FOLDER / safe
+    if not path.exists(): abort(404)
+    return send_from_directory(str(UPLOAD_FOLDER), safe)
+
+@app.route("/api/predict", methods=["POST"])
+def api_predict():
+    cleanup_old_uploads()
+    if "file" not in request.files: return jsonify({"error": "file required"}), 400
+    file = request.files["file"]
+    if file.filename == "" or not allowed_file(file.filename): return jsonify({"error": "invalid file"}), 400
+    file_bytes = file.read()
+    arr = prepare_image_from_bytes(file_bytes)
+    preds = predict_topk(arr, topk=TOP_K)
+    filename = secure_timestamped_filename(file.filename)
+    path = UPLOAD_FOLDER / filename
+    with open(path, "wb") as f: f.write(file_bytes)
+    return jsonify({"predictions": preds, "filename": filename}), 200
+
+if _name_ == "_main_":
+    port = int(os.environ.get("PORT", 8501))
+    app.run(host="0.0.0.0", port=port, debug=False)
