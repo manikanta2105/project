@@ -1,0 +1,251 @@
+"""
+app.py
+
+Professional Real-Time Stock Market Dashboard (Streamlit)
+
+Features:
+- Multi-ticker watchlist
+- Intraday data via yfinance (configurable period & interval)
+- Interactive Plotly candlestick + indicators (SMA, EMA, Bollinger Bands, RSI)
+- Metrics panel, CSV download, simple price alert
+- Robust caching and error handling
+"""
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime
+import io
+import logging
+
+# ---------- Page config ----------
+st.set_page_config(page_title="Real-Time Stock Dashboard", layout="wide", initial_sidebar_state="expanded")
+LOG = logging.getLogger("streamlit")
+LOG.setLevel(logging.INFO)
+
+# ---------- Utility functions ----------
+@st.cache_data(ttl=20)
+def fetch_price_data(ticker: str, period: str = "1d", interval: str = "1m") -> pd.DataFrame:
+    """
+    Fetches price history using yfinance and returns a cleaned DataFrame indexed by datetime.
+    Cached for a short TTL to avoid rate limits during development/demo.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=period, interval=interval, actions=False, auto_adjust=False)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.rename_axis("Datetime").reset_index()
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime").sort_index()
+        # keep core cols
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+        return df
+    except Exception as e:
+        LOG.exception("Failed to fetch data for %s: %s", ticker, e)
+        return pd.DataFrame()
+
+def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    """
+    Compute RSI using Wilder's smoothing:
+    - Gains / losses, then smoothed average using exponential weighted mean with com=(window-1)
+    """
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    # Wilder smoothing (exponential moving average with alpha=1/window)
+    avg_gain = gain.ewm(alpha=1/window, min_periods=window).mean()
+    avg_loss = loss.ewm(alpha=1/window, min_periods=window).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.fillna(0)
+    return rsi
+
+def add_indicators(df: pd.DataFrame, sma_window=20, ema_window=20, rsi_window=14, bb_window=20, bb_std=2):
+    """
+    Add common indicators to DataFrame: SMA, EMA, RSI, Bollinger Bands.
+    Returns new DataFrame (copy).
+    """
+    df = df.copy()
+    df[f"SMA_{sma_window}"] = df["Close"].rolling(window=sma_window, min_periods=1).mean()
+    df[f"EMA_{ema_window}"] = df["Close"].ewm(span=ema_window, adjust=False).mean()
+    df[f"RSI_{rsi_window}"] = compute_rsi(df["Close"], window=rsi_window)
+    df[f"BB_MA_{bb_window}"] = df["Close"].rolling(window=bb_window, min_periods=1).mean()
+    df[f"BB_STD_{bb_window}"] = df["Close"].rolling(window=bb_window, min_periods=1).std()
+    df[f"BB_UPPER_{bb_window}"] = df[f"BB_MA_{bb_window}"] + (bb_std * df[f"BB_STD_{bb_window}"])
+    df[f"BB_LOWER_{bb_window}"] = df[f"BB_MA_{bb_window}"] - (bb_std * df[f"BB_STD_{bb_window}"])
+    return df
+
+def create_candlestick_figure(df: pd.DataFrame, ticker: str, show_sma=True, show_ema=True, show_bb=True, show_rsi=True):
+    """
+    Build a Plotly figure with candlestick + indicators and volume (and RSI subplot if requested).
+    """
+    # Determine rows: 2 rows (price+volume) or 3 rows if RSI shown
+    show_rsi_flag = show_rsi and (f"RSI_14" in df.columns or any(col.startswith("RSI_") for col in df.columns))
+    rows = 3 if show_rsi_flag else 2
+    row_heights = [0.6, 0.25, 0.15] if show_rsi_flag else [0.75, 0.25]
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.03,
+                        row_heights=row_heights,
+                        specs=[[{"type":"xy"}]] * rows)
+
+    # Candlestick
+    fig.add_trace(
+        go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name=ticker),
+        row=1, col=1
+    )
+
+    # Indicators
+    if show_sma and any(col.startswith("SMA_") for col in df.columns):
+        sma_col = [c for c in df.columns if c.startswith("SMA_")][0]
+        fig.add_trace(go.Scatter(x=df.index, y=df[sma_col], mode="lines", name=sma_col, line=dict(width=1.5)), row=1, col=1)
+    if show_ema and any(col.startswith("EMA_") for col in df.columns):
+        ema_col = [c for c in df.columns if c.startswith("EMA_")][0]
+        fig.add_trace(go.Scatter(x=df.index, y=df[ema_col], mode="lines", name=ema_col, line=dict(width=1.5, dash="dash")), row=1, col=1)
+
+    if show_bb and any(col.startswith("BB_UPPER_") for col in df.columns):
+        upper_col = [c for c in df.columns if c.startswith("BB_UPPER_")][0]
+        lower_col = [c for c in df.columns if c.startswith("BB_LOWER_")][0]
+        ma_col = [c for c in df.columns if c.startswith("BB_MA_")][0]
+        fig.add_trace(go.Scatter(x=df.index, y=df[upper_col], mode="lines", name="BB Upper", line=dict(width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df[lower_col], mode="lines", name="BB Lower", line=dict(width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df[ma_col], mode="lines", name="BB MA", line=dict(width=1)), row=1, col=1)
+
+    # Volume
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume", showlegend=False), row=2, col=1)
+
+    # RSI subplot
+    if show_rsi_flag:
+        rsi_col = [c for c in df.columns if c.startswith("RSI_")][0]
+        fig.add_trace(go.Scatter(x=df.index, y=df[rsi_col], mode="lines", name=rsi_col), row=3, col=1)
+        fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0,100])
+
+    fig.update_layout(title=f"{ticker} — Price & Indicators", xaxis_rangeslider_visible=False,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                      margin=dict(l=40, r=20, t=60, b=40), template="plotly_white", height=750)
+    return fig
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Return CSV bytes for download"""
+    buffer = io.StringIO()
+    df.reset_index().to_csv(buffer, index=False)
+    return buffer.getvalue().encode()
+
+# ---------- UI: Header ----------
+st.markdown("""
+# 📈 Real-Time Stock Market Dashboard
+*Professional* Streamlit dashboard — intraday quotes, technical indicators, watchlist & downloads.
+""")
+
+# ---------- Sidebar controls ----------
+with st.sidebar:
+    st.header("Controls")
+    default_ticker = "AAPL"
+    period = st.selectbox("Period (range)", options=["1d","2d","5d","7d","30d","60d","90d"], index=0)
+    interval = st.selectbox("Interval", options=["1m","2m","5m","15m","30m","60m","90m","1d"], index=0)
+    sma_window = st.number_input("SMA window", min_value=5, max_value=200, value=20, step=1)
+    ema_window = st.number_input("EMA window", min_value=5, max_value=200, value=20, step=1)
+    rsi_window = st.number_input("RSI window", min_value=7, max_value=50, value=14, step=1)
+    bb_window = st.number_input("Bollinger window", min_value=5, max_value=200, value=20, step=1)
+    bb_std = st.number_input("Bollinger std dev", min_value=1.0, max_value=4.0, value=2.0, step=0.1)
+    auto_refresh = st.selectbox("Auto-refresh (seconds)", options=[0,15,30,60,120], index=2)
+    st.markdown("---")
+    st.markdown("### Watchlist")
+    # Simple watchlist using session_state
+    if "watchlist" not in st.session_state:
+        st.session_state.watchlist = [default_ticker]
+    new_ticker = st.text_input("Add ticker (symbol)", value="")
+    if st.button("Add to watchlist"):
+        sym = new_ticker.strip().upper()
+        if sym and sym not in st.session_state.watchlist:
+            st.session_state.watchlist.append(sym)
+            st.experimental_rerun()
+    for t in st.session_state.watchlist:
+        cols = st.columns([0.7, 0.25, 0.05])
+        cols[0].write(f"{t}")
+        if cols[1].button("View", key=f"view_{t}"):
+            st.session_state.selected = t
+            st.experimental_rerun()
+        if cols[2].button("X", key=f"del_{t}"):
+            st.session_state.watchlist.remove(t)
+            # ensure selected remains valid
+            if st.session_state.watchlist:
+                st.session_state.selected = st.session_state.watchlist[0]
+            else:
+                st.session_state.selected = None
+            st.experimental_rerun()
+
+    st.markdown("---")
+    st.markdown("### Alerts")
+    alert_enabled = st.checkbox("Enable price alert", value=False)
+    alert_price = st.number_input("Alert price (absolute)", min_value=0.0, value=0.0, step=0.1)
+    st.markdown("---")
+    st.caption("Data: Yahoo Finance via yfinance. For production, replace with a paid real-time data provider.")
+
+# ---------- Main: Select ticker ----------
+selected = st.session_state.get("selected", st.session_state.watchlist[0] if st.session_state.watchlist else default_ticker)
+st.subheader(f"Selected ticker: {selected}")
+
+# ---------- Fetch data ----------
+with st.spinner(f"Fetching {selected} — period={period} interval={interval}"):
+    df = fetch_price_data(selected, period=period, interval=interval)
+
+if df.empty:
+    st.error(f"No data available for '{selected}'. Try another ticker, a longer period, or a different interval.")
+    st.stop()
+
+# ---------- Compute indicators ----------
+df_ind = add_indicators(df, sma_window=sma_window, ema_window=ema_window, rsi_window=rsi_window, bb_window=bb_window, bb_std=bb_std)
+
+# ---------- Top metrics ----------
+latest = df_ind.iloc[-1]
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Last Price", f"{latest['Close']:.2f}")
+col2.metric("Change (1st→last)", f"{(latest['Close'] - df_ind['Close'].iloc[0]):+.2f}")
+col3.metric("Volume (latest)", f"{int(latest['Volume'])}")
+col4.metric(f"SMA {sma_window}", f"{latest.get(f'SMA_{sma_window}', np.nan):.2f}")
+
+# ---------- Alerts ----------
+if alert_enabled and alert_price > 0:
+    if latest["Close"] >= alert_price:
+        st.success(f"Price alert: {selected} has reached {latest['Close']:.2f} ≥ {alert_price:.2f}")
+    else:
+        st.info(f"Alert armed: {selected} < {alert_price:.2f} (current {latest['Close']:.2f})")
+
+# ---------- Plot ----------
+show_sma = True
+show_ema = True
+show_bb = True
+show_rsi = True
+
+fig = create_candlestick_figure(df_ind, selected, show_sma=show_sma, show_ema=show_ema, show_bb=show_bb, show_rsi=show_rsi)
+st.plotly_chart(fig, use_container_width=True)
+
+# ---------- Data table and download ----------
+with st.expander("View raw data & download"):
+    st.dataframe(df_ind.tail(200))
+    csv_bytes = df_to_csv_bytes(df_ind)
+    st.download_button("Download CSV", data=csv_bytes, file_name=f"{selected}data{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv", mime="text/csv")
+
+# ---------- Manual refresh ----------
+if st.button("Refresh now"):
+    fetch_price_data.clear()  # clear cache for immediate re-fetch
+    st.experimental_rerun()
+
+# ---------- Auto-refresh (simple) ----------
+if auto_refresh > 0:
+    st.caption(f"Auto-refresh is ON: every {auto_refresh} seconds. (Streamlit will rerun this script on interactions.)")
+    # Implementing a true timed auto-refresh requires st_autorefresh or interval reruns; keep simple for portability.
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=auto_refresh * 1000, limit=None, key="auto_refresh")
+    except Exception:
+        # If streamlit_autorefresh not available, show info only
+        st.info("Install streamlit-autorefresh for automatic timed refreshes: pip install streamlit-autorefresh")
+
+# ---------- Footer ----------
+st.markdown("---")
+st.markdown("*Notes:* This dashboard uses Yahoo Finance for demonstration purposes. Data availability for intraday intervals varies by symbol. Not financial advice.")
